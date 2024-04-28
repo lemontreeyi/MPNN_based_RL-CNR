@@ -47,7 +47,7 @@ hparams = {
     #'dropout_rate': 0.05,
     "link_state_dim": 20,
     "readout_units": 35,
-    "learning_rate": 0.0001,
+    "lr": 0.001,
     "T": 4,
     "num_demands": len(listofDemands),
     "batch_size": 32,
@@ -60,11 +60,12 @@ cfg = EasyDict(
         "env_name": "GraphEnv-v1",
         "seed": 1,
         "save_model": True,
-        "load_model": True,
+        "load_model": False,
         "train_episodes": 5e2,
-        "start_step": 1e3,
-        "evaluate_freq": 10,
+        "evaluate_episodes": 5,
+        "start_size": 1e3,
         "max_steps": 1e4,
+        "evaluate_freq": 10,
     }
 )
 
@@ -103,12 +104,11 @@ if __name__ == "__main__":
     """开始run agent并训练，注意为off-policy训练"""
     print("---------------------------------------")
     print(
-        f"Policy: {cfg.MPNN_based_A2C}, Env: {cfg.env_name}, Seed: {cfg.seed}, Device: {cfg.device}, Traning start..."
+        f"Policy: {cfg.algorithm_name}, Env: {cfg.env_name}, Seed: {cfg.seed}, Device: {device}, Traning start..."
     )
     print("---------------------------------------")
 
     for i_ep in range(int(cfg.train_episodes)):
-        print("EPISODE: ", i_ep + 1)
         state, old_demand, old_src, old_dst = env.reset()
         ep_rewards = 0
 
@@ -143,7 +143,40 @@ if __name__ == "__main__":
             """一个回合结束后，直接开启下一个回合"""
             if done:
                 break
-            
+
             """收集足够数据后开始训练"""
-            if replay_buffer.size > cfg.start_steps:
-            
+            if replay_buffer.size > cfg.start_size:
+                agent.train(env, replay_buffer)
+
+        if replay_buffer.size > cfg.start_size and (i_ep + 1) % cfg.evaluate_freq == 0:
+            evaluate_rewards_list = [0] * int(cfg.evaluate_episodes)
+            # 对目前的actor进行评估
+            for ep in range(int(cfg.evaluate_episodes)):
+                state, old_demand, old_src, old_dst = env_eval.reset()
+                done = False
+                while True:
+                    action_dist, _ = agent.get_action_dist(
+                        env_eval, state, old_demand, old_src, old_dst
+                    )
+                    action = action_dist.sample()
+                    next_state, reward, done, new_demand, new_src, new_dst = (
+                        env_eval.make_step(
+                            state, action.item(), old_demand, old_src, old_dst
+                        )
+                    )
+                    state = next_state
+                    old_demand = new_demand
+                    old_src = new_src
+                    old_dst = new_dst
+                    evaluate_rewards_list[ep] += reward
+                    if done:
+                        break
+            evaluate_return = sum(evaluate_rewards_list) / len(evaluate_rewards_list)
+            print(
+                f"Evaluation over {cfg.evaluate_episodes}, average return: {evaluate_return:.3f}"
+            )
+            if cfg.save_model:
+                agent.save(filename)
+        print(
+            f"training episode: no.{i_ep + 1}, episode_return: {ep_rewards}, buffer_size: {replay_buffer.size}"
+        )

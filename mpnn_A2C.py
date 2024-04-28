@@ -12,19 +12,22 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def init_weight(m):
-    if isinstance(m, (nn.Linear, nn.GRUCell)):
+    if isinstance(m, (nn.Linear,)):
         nn.init.normal_(m.weight, std=0.1)
+    elif isinstance(m, (nn.GRUCell,)):
+        nn.init.normal_(m.weight_ih, std=0.1)
+        nn.init.normal_(m.weight_hh, std=0.1)
 
 
 def cummax(tensor_list, extractor):
     """计算tensor_list中的累积最大值，并返回一个list"""
-    cummaxs = []
+    cummaxs = [0, ]
     # 下面这个列表里存的是普通int类型数值
     max_element_list = []
     for tensor in tensor_list:
         tensor = extractor(tensor)
-        max_element_list.append(torch.maximum(tensor).item() + 1)
-    for i in range(len(max_element_list)):
+        max_element_list.append(torch.max(tensor).item() + 1)
+    for i in range(len(max_element_list) - 1):
         cummaxs.append(sum(max_element_list[0 : i + 1]))
     cummaxs = torch.tensor(cummaxs).to(device)
     return cummaxs
@@ -63,7 +66,6 @@ class Actor(nn.Module):
             nn.Linear(self.readout_units, self.readout_units),
             nn.SELU(),
             nn.Linear(self.readout_units, 1),
-            nn.Softmax(),
         )
 
         self.Message.apply(init_weight)
@@ -82,7 +84,6 @@ class Actor(nn.Module):
         """
         输出为k条可选path的分布
         """
-
         # 循环执行T次
         for _ in range(self.T):
             # 将mainEdge和neighbour的state结合起来
@@ -98,12 +99,12 @@ class Actor(nn.Module):
             m = self.Message(states_concatEdges)
 
             """1.b 计算每条边m的加和，通过neighbours中的id实现"""
-            # 此时links_M.shape=(num_edges, link_state_dim)
-            links_M = scatter_add(src=m, index=id_neighbourEdges, dim_size=num_edges)
+            # 此时links_M.shape=(num_edges * k, link_state_dim)
+            links_M = scatter_add(m, id_neighbourEdges, dim=0)
 
             """为每条链路更新state"""
-            outputs, links_state_list = self.Update(links_M, [links_state])
-            links_state = links_state_list[0]
+            links_state_new = self.Update(links_M, links_state)
+            links_state = links_state_new
 
         K_paths_ids = []
         for i in range(K):
@@ -118,6 +119,7 @@ class Actor(nn.Module):
         # r.shape = (k, 1)
         r = self.Readout(k_path_outputs)
         r = r.flatten()
+        r = F.softmax(r, dim=0)
         # 建立一个概率分布，方便后续采样action
         # dist.shape = (k, )
         dist = Categorical(r)
@@ -152,7 +154,6 @@ class Critic(nn.Module):
             nn.Linear(self.readout_units, self.readout_units),
             nn.SELU(),
             nn.Linear(self.readout_units, 1),
-            nn.Softmax(),
         )
 
         self.Message.apply(init_weight)
@@ -187,11 +188,11 @@ class Critic(nn.Module):
 
             """1.b 计算每条边m的加和，通过neighbours中的id实现"""
             # 此时links_M.shape=(num_edges, link_state_dim)
-            links_M = scatter_add(src=m, index=id_neighbourEdges, dim_size=num_edges)
+            links_M = scatter_add(m, id_neighbourEdges, dim=0)
 
             """为每条链路更新state"""
-            outputs, links_state_list = self.Update(links_M, [links_state])
-            links_state = links_state_list[0]
+            links_state_new = self.Update(links_M, links_state)
+            links_state = links_state_new
 
         # 迭代更新完state后 将所有的边做加和
         total_state = torch.sum(links_state, dim=0)
@@ -209,6 +210,8 @@ class A2C:
         self.num_demands = self.hparams["num_demands"]
         self.batch_size = self.hparams["batch_size"]
         self.discount_rate = self.hparams["discount_rate"]
+        self.lr = self.hparams["lr"]
+        self.K = env.K
 
         self.capacity_feature = None
         self.bw_allocated_feature = np.zeros((env.numEdges, len(env.listofDemands)))
@@ -216,8 +219,8 @@ class A2C:
         self.actor = Actor(self.hparams)
         self.critic = Critic(self.hparams)
 
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.hparams.lr)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.hparams.lr)
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.lr)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.lr)
 
     def get_graph_features_actor(self, env, links_state):
         self.bw_allocated_feature.fill(0.0)
@@ -239,13 +242,16 @@ class A2C:
         num_edges = env.numEdges
         length = env.firstTrueSize
         # 将ndArray转为tensor，注意to(device)
+        # shape=(numEdges, )
         betweenness = torch.tensor(env.between_feature, dtype=torch.float32).to(device)
+        # shape=(numEdges, len(numofdemand))
         bw_allocated = torch.tensor(self.bw_allocated_feature, dtype=torch.float32).to(
             device
         )
+        # shape=(numEdges, )
         capacities = torch.tensor(self.capacity_feature, dtype=torch.float32).to(device)
-        main_edges_id = torch.tensor(env.first, dtype=torch.int32).to(device)
-        neighbour_edges_id = torch.tensor(env.second, dtype=torch.int32).to(device)
+        main_edges_id = torch.tensor(env.first, dtype=torch.int64).to(device)
+        neighbour_edges_id = torch.tensor(env.second, dtype=torch.int64).to(device)
 
         # 规范它们的shape
         capacities = torch.reshape(capacities[0:num_edges], (num_edges, 1))
@@ -274,8 +280,8 @@ class A2C:
         num_edges = env.numEdges
         betweenness = torch.tensor(env.between_feature, dtype=torch.float32).to(device)
         capacities = torch.tensor(self.capacity_feature, dtype=torch.float32).to(device)
-        main_edges_id = torch.tensor(env.first, dtype=torch.int32).to(device)
-        neighbour_edges_id = torch.tensor(env.second, dtype=torch.int32).to(device)
+        main_edges_id = torch.tensor(env.first, dtype=torch.int64).to(device)
+        neighbour_edges_id = torch.tensor(env.second, dtype=torch.int64).to(device)
 
         betweenness = torch.reshape(betweenness[0:num_edges], (num_edges, 1))
         capacities = torch.reshape(capacities[0:num_edges], (num_edges, 1))
@@ -308,7 +314,7 @@ class A2C:
             state_copy = np.copy(state)
             currentPath = pathList[path_id]
             i = 0
-            j = 0
+            j = 1
 
             # 对所选path进行逐edge遍历, 并将demand的带宽进行分配
             while j < len(currentPath):
@@ -331,7 +337,7 @@ class A2C:
         注意：由于我们有k条可选paths，那么在传入policy net时，要将k条paths的features进行cat操作，并且其他辅助tensor也要对应变换
         """
         k_paths_links_state = torch.cat(
-            [state for state in k_paths_features["links_state"]], dim=0
+            [features["links_state"] for features in k_paths_features], dim=0
         )
 
         # 由于main和neighbours属性都是用作index作用
@@ -357,9 +363,9 @@ class A2C:
             ],
             dim=0,
         )
-        k_paths_num_edges = 0
-        for features in k_paths_features:
-            k_paths_num_edges += features["num_edges"]
+        # k_paths_num_edges = 0
+        # for features in k_paths_features:
+        #     k_paths_num_edges += features["num_edges"]
 
         # 通过actor得到可选action的概率分布
         dist = self.actor(
@@ -367,7 +373,7 @@ class A2C:
             self.K,
             k_paths_main_edges_id,
             k_paths_neighbour_edges_id,
-            k_paths_num_edges,
+            env.numEdges,
             is_train=False,
         )
 
@@ -375,7 +381,7 @@ class A2C:
             "k_paths_links_state": k_paths_links_state,
             "k_paths_main_edges_id": k_paths_main_edges_id,
             "k_paths_neighbour_edges_id": k_paths_neighbour_edges_id,
-            "k_paths_num_edges": k_paths_num_edges,
+            "num_edges": env.numEdges,
         }
 
         return dist, tensor
