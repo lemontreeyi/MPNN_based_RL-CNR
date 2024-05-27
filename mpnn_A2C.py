@@ -195,7 +195,7 @@ class Critic(nn.Module):
             links_state = links_state_new
 
         # 迭代更新完state后 将所有的边做加和
-        total_state = torch.sum(links_state, dim=0)
+        total_state = torch.sum(links_state, dim=0).unsqueeze(0)
 
         # 送入readout函数，求出k条paths对应的值作为分布
         r = self.Readout(total_state)
@@ -221,6 +221,13 @@ class A2C:
 
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.lr)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.lr)
+
+        # 用于存储算法运行过程中的数据
+        self.evaluate_return_array = np.array([])
+        self.bw_utilization_array = np.array([])
+        self.actor_loss_array = np.array([])
+        self.critic_loss_array = np.array([])
+
 
     def get_graph_features_actor(self, env, links_state):
         self.bw_allocated_feature.fill(0.0)
@@ -377,28 +384,27 @@ class A2C:
             is_train=False,
         )
 
-        tensor = {
-            "k_paths_links_state": k_paths_links_state,
-            "k_paths_main_edges_id": k_paths_main_edges_id,
-            "k_paths_neighbour_edges_id": k_paths_neighbour_edges_id,
-            "num_edges": env.numEdges,
-        }
+        actor_input = (k_paths_links_state, self.K, k_paths_main_edges_id, k_paths_neighbour_edges_id, env.numEdges)
 
-        return dist, tensor
+        return dist, actor_input
 
     def train(self, env, replay_buffer):
         # 采样replay_buffer
         samples_list = replay_buffer.sample(self.batch_size)
 
+        advantage_list = []
+        value_loss_list = []
+        policy_loss_list = []
         # 手动处理batch_size（后续可以将linear改为conv2d？
         for sample in samples_list:
+            actor_input = sample["actor_input"]
             features_critic = sample["features_critic"]
             action = sample["action"]
-            action_dist = sample["action_dist"]
             next_features_critic = sample["next_features_critic"]
             reward = sample["reward"]
             not_done = sample["not_done"]
 
+            action_dist = self.actor(*actor_input)
             log_probs = action_dist.log_prob(action)
             entropy = action_dist.entropy()
 
@@ -407,27 +413,36 @@ class A2C:
                 features_critic["main_edges_id"],
                 features_critic["neighbour_edges_id"],
                 features_critic["num_edges"],
-            )[0]
+            )[0][0]
 
             future_V = self.critic(
                 next_features_critic["links_state_critic"],
                 next_features_critic["main_edges_id"],
                 next_features_critic["neighbour_edges_id"],
                 next_features_critic["num_edges"],
-            )[0]
+            )[0][0]
 
             Q = reward + self.discount_rate * future_V * not_done
-            advantage = Q - current_V
+            advantage = (Q - current_V).detach()
+            policy_loss = - (log_probs * advantage + 0.001 * entropy)
+            value_loss = F.mse_loss(current_V, Q)
+            value_loss_list.append(value_loss)
+            policy_loss_list.append(policy_loss)
 
-            critic_loss = -advantage
-            self.critic_optimizer.zero_grad()
-            critic_loss.backward()
-            self.critic_optimizer.step()
+        actor_loss = torch.mean(torch.stack(policy_loss_list))
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
 
-            actor_loss = -(log_probs * advantage.detach() + 0.001 * entropy)
-            self.actor_optimizer.zero_grad()
-            actor_loss.backward()
-            self.actor_optimizer.step()
+        critic_loss = torch.mean(torch.stack(value_loss_list))
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+
+        # 存储过程数据
+        self.actor_loss_array = np.append(self.actor_loss_array, actor_loss.item())
+        self.critic_loss_array = np.append(self.critic_loss_array, critic_loss.item())
+
 
     def save(self, filename):
         """保存model和optimizer的参数"""
